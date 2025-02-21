@@ -1,0 +1,312 @@
+import sys
+import os
+import subprocess
+import json
+import webbrowser
+from datetime import datetime
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar, QFileDialog,
+                             QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QHeaderView,
+                             QMenu, QAction, QInputDialog, QSystemTrayIcon, QMessageBox, QDockWidget,
+                             QSplitter)
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QObject, QSize
+from PyQt5.QtGui import QFont, QColor, QIcon, QTextCursor, QPalette
+import qdarkstyle
+
+# Fix for WSL permissions warning
+os.environ['XDG_RUNTIME_DIR'] = f'/tmp/runtime-{os.getuid()}'
+os.makedirs(os.environ['XDG_RUNTIME_DIR'], exist_ok=True)
+
+class ScanWorker(QThread):
+    update_log = pyqtSignal(str, str)  # (tool, message)
+    progress_update = pyqtSignal(int)
+    scan_complete = pyqtSignal(dict)
+    critical_finding = pyqtSignal(dict)
+
+    def __init__(self, target, output_dir):
+        super().__init__()
+        self.target = target
+        self.output_dir = output_dir
+        self.config = self.load_config()
+        self.running = True
+
+    def load_config(self):
+        return {
+            'threads': 50,
+            'wordlists': {
+                'web_content': '/usr/share/seclists/Discovery/Web-Content/raft-large-words.txt',
+                'subdomains': '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt'
+            }
+        }
+
+    def run(self):
+        results = {}
+        try:
+            results['nmap'] = self.run_nmap()
+            results['gobuster'] = self.run_gobuster()
+            results['vhosts'] = self.run_vhost_scan()
+            results['nikto'] = self.run_nikto()
+            results['rustscan'] = self.run_rustscan()
+            self.scan_complete.emit(results)
+            self.generate_report(results)
+        except Exception as e:
+            self.update_log.emit('error', f"Scan failed: {str(e)}")
+
+    def run_nmap(self):
+        self.update_log.emit('nmap', "Starting comprehensive Nmap scan...")
+        cmd = f"nmap -sV -sC -p- -T4 -oA {self.output_dir}/nmap {self.target}"
+        return self.execute_command(cmd)
+
+    def run_gobuster(self):
+        self.update_log.emit('gobuster', "Starting directory bruteforce...")
+        cmd = f"gobuster dir -u http://{self.target} -w {self.config['wordlists']['web_content']} -o {self.output_dir}/gobuster.txt"
+        return self.execute_command(cmd)
+
+    def run_vhost_scan(self):
+        self.update_log.emit('vhost', "Starting VHost fuzzing...")
+        cmd = f"gobuster vhost -u http://{self.target} -w {self.config['wordlists']['subdomains']} -o {self.output_dir}/vhosts.txt"
+        return self.execute_command(cmd)
+
+    def run_nikto(self):
+        self.update_log.emit('nikto', "Starting web vulnerability scan...")
+        cmd = f"nikto -h http://{self.target} -output {self.output_dir}/nikto.html -Format htm"
+        return self.execute_command(cmd)
+
+    def run_rustscan(self):
+        self.update_log.emit('rustscan', "Starting port scanning...")
+        cmd = f"rustscan -a {self.target} --ulimit 5000 -g -o {self.output_dir}/rustscan.txt"
+        return self.execute_command(cmd)
+
+    def execute_command(self, cmd):
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        output = ""
+        while self.running:
+            line = process.stdout.readline()
+            if not line:
+                break
+            output += line
+            self.update_log.emit('process', line.strip())
+        return output
+
+    def generate_report(self, results):
+        report = f"# Pentest Report\n\n## Target: {self.target}\n\n"
+        for tool, data in results.items():
+            report += f"### {tool.upper()}\n```\n{data[:500]}...\n```\n\n"
+        with open(f"{self.output_dir}/report.md", "w") as f:
+            f.write(report)
+        self.update_log.emit('report', f"Report generated at {self.output_dir}/report.md")
+
+class HTBAssaultPro(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.target = ""
+        self.output_dir = ""
+        self.scan_thread = None
+        self.init_ui()
+        self.init_tray()
+        self.create_project_structure()
+
+    def init_ui(self):
+        self.setWindowTitle("HTB Nexus Pro v4.0")
+        self.setGeometry(100, 100, 1400, 900)
+        self.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyqt5'))
+        self.setWindowIcon(QIcon('icon.png'))
+
+        # Main tabs
+        self.tabs = QTabWidget()
+        self._init_recon_tab()
+        self._init_exploit_tab()
+        self._init_reporting_tab()
+        self._init_notes_tab()
+        self.setCentralWidget(self.tabs)
+
+        # Status bar
+        self.status_bar = self.statusBar()
+        self.progress = QProgressBar()
+        self.status_bar.addPermanentWidget(self.progress)
+
+        # Dock widget
+        self.dock = QDockWidget("Quick Actions", self)
+        self._init_dock_widget()
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.dock)
+
+    def _init_dock_widget(self):
+        dock_content = QWidget()
+        layout = QVBoxLayout()
+        
+        # Quick scan buttons
+        self.btn_quick_nmap = QPushButton("Quick Nmap")
+        self.btn_quick_nmap.clicked.connect(lambda: self.run_quick_scan('nmap'))
+        layout.addWidget(self.btn_quick_nmap)
+
+        self.btn_quick_dir = QPushButton("Quick Directory Scan")
+        self.btn_quick_dir.clicked.connect(lambda: self.run_quick_scan('dir'))
+        layout.addWidget(self.btn_quick_dir)
+
+        # Project stats
+        self.stats_tree = QTreeWidget()
+        self.stats_tree.setHeaderLabels(["Metric", "Value"])
+        layout.addWidget(self.stats_tree)
+
+        dock_content.setLayout(layout)
+        self.dock.setWidget(dock_content)
+
+    def _init_recon_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        # Target input
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("Target:"))
+        self.target_input = QLineEdit()
+        self.target_input.setPlaceholderText("Enter IP or domain")
+        target_layout.addWidget(self.target_input)
+        
+        self.btn_start = QPushButton("Start Full Enumeration")
+        self.btn_start.clicked.connect(self.start_full_scan)
+        target_layout.addWidget(self.btn_start)
+        layout.addLayout(target_layout)
+
+        # Results display
+        splitter = QSplitter(Qt.Vertical)
+        
+        self.result_tree = QTreeWidget()
+        self.result_tree.setHeaderLabels(["Service", "Port", "Status", "Details"])
+        splitter.addWidget(self.result_tree)
+
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        splitter.addWidget(self.log_view)
+
+        layout.addWidget(splitter)
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Reconnaissance")
+
+    def _init_exploit_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        self.exploit_table = QTableWidget()
+        self.exploit_table.setColumnCount(5)
+        self.exploit_table.setHorizontalHeaderLabels(["CVE", "Severity", "Service", "Port", "Exploit"])
+        layout.addWidget(self.exploit_table)
+
+        # Exploit controls
+        control_layout = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh Exploits")
+        self.btn_run = QPushButton("Run Exploit")
+        control_layout.addWidget(self.btn_refresh)
+        control_layout.addWidget(self.btn_run)
+        layout.addLayout(control_layout)
+
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Exploitation")
+
+    def _init_reporting_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        self.report_editor = QTextEdit()
+        layout.addWidget(self.report_editor)
+        
+        # Report controls
+        btn_layout = QHBoxLayout()
+        self.btn_save = QPushButton("Save Report")
+        self.btn_export = QPushButton("Export HTML")
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_export)
+        layout.addLayout(btn_layout)
+
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Reporting")
+
+    def _init_notes_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+        self.notes_editor = QTextEdit()
+        layout.addWidget(self.notes_editor)
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Notes")
+
+    def init_tray(self):
+        self.tray = QSystemTrayIcon(QIcon('icon.png'), self)
+        menu = QMenu()
+        restore = menu.addAction("Show")
+        quit_action = menu.addAction("Quit")
+        self.tray.setContextMenu(menu)
+        self.tray.show()
+
+    def create_project_structure(self):
+        base_dir = os.path.expanduser("~/HTB_Projects")
+        if not os.path.exists(base_dir):
+            os.makedirs(base_dir)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = os.path.join(base_dir, timestamp)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def start_full_scan(self):
+        self.target = self.target_input.text()
+        if not self.validate_target():
+            self.show_error("Invalid target format!")
+            return
+
+        self.progress.setRange(0, 0)  # Indeterminate
+        self.scan_thread = ScanWorker(self.target, self.output_dir)
+        self.scan_thread.update_log.connect(self.update_log)
+        self.scan_thread.scan_complete.connect(self.scan_completed)
+        self.scan_thread.start()
+
+    def validate_target(self):
+        return len(self.target) > 4  # Basic validation
+
+    def update_log(self, tool, message):
+        self.log_view.append(f"[{datetime.now().strftime('%H:%M:%S')}] {tool.upper()}: {message}")
+        self.log_view.moveCursor(QTextCursor.End)
+
+    def scan_completed(self, results):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self.update_results_view(results)
+
+    def update_results_view(self, results):
+        self.result_tree.clear()
+        # Process nmap results
+        if 'nmap' in results:
+            for line in results['nmap'].split('\n'):
+                if 'open' in line and '/tcp' in line:
+                    parts = line.split()
+                    item = QTreeWidgetItem([
+                        parts[2],  # Service
+                        parts[0].split('/')[0],  # Port
+                        "Open", 
+                        " ".join(parts[3:])
+                    ])
+                    self.result_tree.addTopLevelItem(item)
+
+    def show_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+
+    def closeEvent(self, event):
+        if self.scan_thread and self.scan_thread.isRunning():
+            reply = QMessageBox.question(
+                self, 'Scan Running',
+                "A scan is in progress. Are you sure you want to quit?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Fira Code", 10))
+    window = HTBAssaultPro()
+    window.show()
+    sys.exit(app.exec_())
